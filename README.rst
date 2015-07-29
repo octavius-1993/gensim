@@ -1,5 +1,5 @@
 ==============================================
-gensim -- Topic Modelling in Python
+An extension of gensim to all multiple subcorpora
 ==============================================
 
 |Travis|_
