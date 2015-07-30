@@ -564,7 +564,7 @@ class LdaModel(interfaces.TransformationABC):
                 else:
                     logger.info('PROGRESS: pass %i, at document #%i/%i' %
                                 (pass_, chunk_no * chunksize + len(chunk), lencorpus))
-                    gammat = self.do_estep(chunk, other)
+                    gammat = self.do_estep(chunk, self.alpha[chunk_no*chunksize: (chunk_no+1)*chunksize], other)
 
 
                 dirty = True
@@ -639,19 +639,23 @@ class LdaModel(interfaces.TransformationABC):
         for d, doc in enumerate(corpus):  # stream the input doc-by-doc, in case it's too large to fit in RAM
             if d % self.chunksize == 0:
                 logger.debug("bound: at document #%i" % d)
+            
+            # Document specific alpha    
+            alphad = self.alpha[d]
+            
             if gamma is None:
-                gammad, _ = self.inference([doc])
+                gammad, _ = self.inference([doc], alphad)
             else:
                 gammad = gamma[d]
             Elogthetad = dirichlet_expectation(gammad)
-
+            
             # E[log p(doc | theta, beta)]
             score += numpy.sum(cnt * logsumexp(Elogthetad + Elogbeta[:, id]) for id, cnt in doc)
 
             # E[log p(theta | alpha) - log q(theta | gamma)]; assumes alpha is a vector
-            score += numpy.sum((self.alpha - gammad) * Elogthetad)
-            score += numpy.sum(gammaln(gammad) - gammaln(self.alpha))
-            score += gammaln(numpy.sum(self.alpha)) - gammaln(numpy.sum(gammad))
+            score += numpy.sum((alphad - gammad) * Elogthetad)
+            score += numpy.sum(gammaln(gammad) - gammaln(alphad))
+            score += gammaln(numpy.sum(alphad)) - gammaln(numpy.sum(gammad))
 
         # compensate likelihood for when `corpus` above is only a sample of the whole corpus
         score *= subsample_ratio
@@ -693,7 +697,9 @@ class LdaModel(interfaces.TransformationABC):
             num_topics = min(num_topics, self.num_topics)
 
             # add a little random jitter, to randomize results around the same alpha
-            sort_alpha = self.alpha + 0.0001 * numpy.random.rand(len(self.alpha))
+            # since alpha has been defined for *each* document, let's just use the first
+            # for now
+            sort_alpha = self.alpha[0] + 0.0001 * numpy.random.rand(len(self.alpha[0]))
 
             sorted_topics = list(matutils.argsort(sort_alpha))
             chosen_topics = sorted_topics[:num_topics // 2] + sorted_topics[-num_topics // 2:]
@@ -707,7 +713,8 @@ class LdaModel(interfaces.TransformationABC):
 
             shown.append(topic)
             if log:
-                logger.info("topic #%i (%.3f): %s" % (i, self.alpha[i], topic))
+                # It no longer makes sense to mention alpha here
+                logger.info("topic #%i: %s" % (i, topic))
 
         return shown
 
@@ -788,12 +795,14 @@ class LdaModel(interfaces.TransformationABC):
         top_topics = sorted(coherence_scores, key=lambda t: t[1], reverse=True)
         return top_topics
 
-    def get_document_topics(self, bow, minimum_probability=None):
+    def get_document_topics(self, bow, alpha, minimum_probability=None):
         """
         Return topic distribution for the given document `bow`, as a list of
         (topic_id, topic_probability) 2-tuples.
 
         Ignore topics with very low probability (below `minimum_probability`).
+        
+        Should provide an alpha value for inference.
 
         """
         # if the input vector is a corpus, return a transformed corpus
@@ -805,7 +814,7 @@ class LdaModel(interfaces.TransformationABC):
         if is_corpus:
             return self._apply(corpus)
 
-        gamma, _ = self.inference([bow])
+        gamma, _ = self.inference([bow], alpha)
         topic_dist = gamma[0] / sum(gamma[0])  # normalize distribution
         return [(topicid, topicvalue) for topicid, topicvalue in enumerate(topic_dist)
                 if topicvalue >= minimum_probability]
