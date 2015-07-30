@@ -790,6 +790,13 @@ def chunkize_serial(iterable, chunksize, as_numpy=False):
             break
         # memory opt: wrap the chunk and then pop(), to avoid leaving behind a dangling reference
         yield wrapped_chunk.pop()
+        
+def alphaChunker(alpha, chunksize):
+    """Chunks the alpha corresponding to your corpus"""
+    n=0
+    while True:
+        yield alpha[n:n+chunkize]
+        n+= chunkize
 
 grouper = chunkize_serial
 
