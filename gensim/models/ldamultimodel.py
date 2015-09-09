@@ -41,7 +41,7 @@ import logging
 import numpy  # for arrays, array broadcasting etc.
 
 from gensim import interfaces, utils, matutils
-import alphaModels
+import gensim.models.alphaModels as alphaModels
 from itertools import chain
 from scipy.special import gammaln, psi  # gamma function utils
 from scipy.special import polygamma
