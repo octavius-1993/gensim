@@ -11,16 +11,20 @@
 
 
 """
-**For a faster implementation of LDA (parallelized for multicore machines), see** :mod:`gensim.models.ldamulticore`.
+**For core LDA, topic modeling and a faster (parallelized) implementation of LDA, see** ``gensim``
 
-Latent Dirichlet Allocation (LDA) in Python with support for multiple subcorpora.
+Multiple corpora Latent Dirichlet Allocation in Python.
 
-This module allows both LDA model estimation from a training corpus and inference of topic
+This module allows both mLDA model estimation from a training corpus and inference of topic
 distribution on new, unseen documents. The model can also be updated with new documents
 for online training.
 
-The core estimation code is based on the `onlineldavb.py` script by M. Hoffman [1]_, see
+The core estimation code is a reworking of the `onlineldavb.py` script by M. Hoffman [1]_, see
 **Hoffman, Blei, Bach: Online Learning for Latent Dirichlet Allocation, NIPS 2010.**
+
+The main alteration to the original Online LDA algorithm is that the alpha parameter can be
+specified individually for each document. Every training or inference action requires this parameter\
+to be specified.
 
 The algorithm:
 
@@ -29,6 +33,9 @@ The algorithm:
   training corpus does not affect memory footprint, can process corpora larger than RAM, and
 * is **distributed**: makes use of a cluster of machines, if available, to
   speed up model estimation
+  
+as in ``gensim``, and now
+
 * allows each **document** to have its own alpha parameter: useful for considering multiple
   subcorpora.
 
@@ -56,7 +63,7 @@ except ImportError:
     from scipy.misc import logsumexp
 
 
-logger = logging.getLogger('gensim.models.ldamodel')
+logger = logging.getLogger('gensim.models.ldamultimodel')
 
 
 def dirichlet_expectation(alpha):
@@ -73,7 +80,7 @@ def dirichlet_expectation(alpha):
 
 class LdaState(utils.SaveLoad):
     """
-    Encapsulate information for distributed computation of LdaModel objects.
+    Encapsulate information for distributed computation of mLdaModel objects.
 
     Objects of this class are sent over the network, so try to keep them lean to
     reduce traffic.
@@ -161,20 +168,22 @@ class LdaState(utils.SaveLoad):
 # endclass LdaState
 
 
-class LdaModel(interfaces.TransformationABC):
+class mLdaModel(interfaces.TransformationABC):
     """
-    The constructor estimates Latent Dirichlet Allocation model parameters based
+    The constructor estimates multiple corpora Latent Dirichlet Allocation model parameters based
     on a training corpus:
 
-    >>> lda = LdaModel(corpus, num_topics=10)
+    >>> model = mLdaModel(corpus, alpha=alpha, num_topics=10)
 
     You can then infer topic distributions on new, unseen documents, with
 
-    >>> doc_lda = lda[doc_bow]
-
-    The model can be updated (trained) with new documents via
-
-    >>> lda.update(other_corpus)
+    >>> doc_lda = model[document, alpha]
+    
+    providing a single alpha value, or
+    
+    >>> vector, _ = model.inference(documents, alpha)
+    
+    providing an alpha object.
 
     Model persistency is achieved through its `load`/`save` methods.
     """
@@ -197,10 +206,10 @@ class LdaModel(interfaces.TransformationABC):
         `alpha` and `eta` are hyperparameters that affect sparsity of the document-topic
         (theta) and topic-word (lambda) distributions. Both default to a symmetric
         1.0/num_topics prior.
-
-        `alpha` can be set to an explicit array = prior of your choice. It also
-        support special values of 'asymmetric' which uses a fixed
-        normalized asymmetric 1.0/topicno prior
+        
+        `alpha` can be a single value, single vector, or an Alpha object.
+        To use two subcorpora, you should provide an instance of
+        TwoPartAlpha.
 
         `eta` can be a scalar for a symmetric prior over topic/word
         distributions, or a matrix of shape num_topics x num_words,
@@ -223,12 +232,13 @@ class LdaModel(interfaces.TransformationABC):
 
         Example:
 
-        >>> lda = LdaModel(corpus, num_topics=100)  # train model
-        >>> print(lda[doc_bow]) # get topic probability distribution for a document
-        >>> lda.update(corpus2) # update the LDA model with additional documents
-        >>> print(lda[doc_bow])
-
-        TODO: finish this example
+        >>> alpha = TwoPartSymmetricAlpha(alpha1, alpha2, D1, 100)  # use two subcorpora
+        >>> model = mLdaModel(corpus, alpha=alpha, num_topics=100)  # train model
+        >>> print(model[doc_bow, alpha[0]]) # get topic probability distribution for a document
+        
+        >>> alpha = UniformSymmetricAlpha(alpha1, 100)
+        >>> model.update(corpus2, alpha) # update the LDA model with additional documents using a single corpus
+        >>> print(model[doc_bow, alpha[0]])
 
         """
         # store user-supplied parameters
@@ -264,31 +274,31 @@ class LdaModel(interfaces.TransformationABC):
         # self.optimize_alpha = (alpha == 'auto')
         
         if isinstance(alpha, alphaModels.Alpha):
-            # self.alpha is now an Alpha
-            self.alpha = alpha
+            # train_alpha is now an Alpha
+            train_alpha = alpha
         else:
             # Continue support for other specifications
             if alpha == 'symmetric' or alpha is None:
                 logger.info("using symmetric alpha at %s" % (1.0 / num_topics))
-                self.alpha = numpy.asarray([1.0 / num_topics for i in xrange(num_topics)])
+                train_alpha = numpy.asarray([1.0 / num_topics for i in xrange(num_topics)])
             elif alpha == 'asymmetric':
-                self.alpha = numpy.asarray([1.0 / (i + numpy.sqrt(num_topics)) for i in xrange(num_topics)])
-                self.alpha /= self.alpha.sum()
-                logger.info("using asymmetric alpha %s" % list(self.alpha))
+                train_alpha = numpy.asarray([1.0 / (i + numpy.sqrt(num_topics)) for i in xrange(num_topics)])
+                train_alpha /= train_alpha.sum()
+                logger.info("using asymmetric alpha %s" % list(train_alpha))
             elif alpha == 'auto':
-                self.alpha = numpy.asarray([1.0 / num_topics for i in xrange(num_topics)])
-                logger.info("using autotuned alpha, starting with %s" % list(self.alpha))
+                train_alpha = numpy.asarray([1.0 / num_topics for i in xrange(num_topics)])
+                logger.info("using autotuned alpha, starting with %s" % list(train_alpha))
             elif isinstance(alpha, numpy.ndarray):
-                self.alpha = alpha
-                if len(self.alpha) != num_topics:
+                train_alpha = alpha
+                if len(train_alpha) != num_topics:
                     raise RuntimeError("invalid alpha shape (must match num_topics)")
             elif isinstance(alpha, float):
-                self.alpha = numpy.asarray([alpha] * num_topics)
+                train_alpha = numpy.asarray([alpha] * num_topics)
             else:
                 raise RuntimeError("Alpha parameter invalid")
             
             # Ensure the resulting alpha is of the correct type
-            self.alpha = alphaModels.UniformAlpha(self.alpha)
+            train_alpha = alphaModels.UniformAlpha(train_alpha)
             
         if eta is None:
             self.eta = 1.0 / num_topics
@@ -326,10 +336,10 @@ class LdaModel(interfaces.TransformationABC):
 
         # if a training corpus was provided, start estimating the model right away
         if corpus is not None:
-            self.update(corpus)
+            self.update(corpus, train_alpha)
 
     def __str__(self):
-        return "LdaModel(num_terms=%s, num_topics=%s, decay=%s, chunksize=%s)" % \
+        return "mLdaModel(num_terms=%s, num_topics=%s, decay=%s, chunksize=%s)" % \
             (self.num_terms, self.num_topics, self.decay, self.chunksize)
 
     def sync_state(self):
@@ -443,7 +453,7 @@ class LdaModel(interfaces.TransformationABC):
         return gamma
 
 
-    def log_perplexity(self, chunk, total_docs=None):
+    def log_perplexity(self, chunk, alpha, total_docs=None):
         """
         Calculate and return per-word likelihood bound, using the `chunk` of
         documents as evaluation corpus. Also output the calculated statistics. incl.
@@ -454,18 +464,19 @@ class LdaModel(interfaces.TransformationABC):
             total_docs = len(chunk)
         corpus_words = sum(cnt for document in chunk for _, cnt in document)
         subsample_ratio = 1.0 * total_docs / len(chunk)
-        perwordbound = self.bound(chunk, subsample_ratio=subsample_ratio) / (subsample_ratio * corpus_words)
+        perwordbound = self.bound(chunk, alpha, subsample_ratio=subsample_ratio) / (subsample_ratio * corpus_words)
         logger.info("%.3f per-word bound, %.1f perplexity estimate based on a held-out corpus of %i documents with %i words" %
                     (perwordbound, numpy.exp2(-perwordbound), len(chunk), corpus_words))
         return perwordbound
 
-    def update(self, corpus, chunksize=None, decay=None, offset=None,
+    def update(self, corpus, alpha, chunksize=None, decay=None, offset=None,
                passes=None, update_every=None, eval_every=None, iterations=None,
                gamma_threshold=None):
         """
         Train the model with new documents, by EM-iterating over `corpus` until
         the topics converge (or until the maximum number of allowed iterations
         is reached). `corpus` must be an iterable (repeatable stream of documents),
+        `alpha` must be an Alpha object.
 
         In distributed mode, the E step is distributed over a cluster of machines.
 
@@ -503,7 +514,7 @@ class LdaModel(interfaces.TransformationABC):
             logger.warning("input corpus stream has no len(); counting documents")
             lencorpus = sum(1 for _ in corpus)
         if lencorpus == 0:
-            logger.warning("LdaModel.update() called with an empty corpus")
+            logger.warning("mLdaModel.update() called with an empty corpus")
             return
 
         if chunksize is None:
@@ -550,10 +561,11 @@ class LdaModel(interfaces.TransformationABC):
             
             ############# TODO: USE ALPHA CHUNKER HERE
             for chunk_no, chunk in enumerate(utils.grouper(corpus, chunksize, as_numpy=True)):
+                alpha_chunk = alpha[chunk_no*chunksize: (chunk_no+1)*chunksize]
                 reallen += len(chunk)  # keep track of how many documents we've processed so far
 
                 if eval_every and ((reallen == lencorpus) or ((chunk_no + 1) % (eval_every * self.numworkers) == 0)):
-                    self.log_perplexity(chunk, total_docs=lencorpus)
+                    self.log_perplexity(chunk, alpha_chunk, total_docs=lencorpus)
 
                 if self.dispatcher:
                     # add the chunk to dispatcher's job queue, so workers can munch on it
@@ -564,7 +576,7 @@ class LdaModel(interfaces.TransformationABC):
                 else:
                     logger.info('PROGRESS: pass %i, at document #%i/%i' %
                                 (pass_, chunk_no * chunksize + len(chunk), lencorpus))
-                    gammat = self.do_estep(chunk, self.alpha[chunk_no*chunksize: (chunk_no+1)*chunksize], other)
+                    gammat = self.do_estep(chunk, alpha_chunk, other)
 
 
                 dirty = True
@@ -622,7 +634,7 @@ class LdaModel(interfaces.TransformationABC):
             # only update if this isn't an additional pass
             self.num_updates += other.numdocs
 
-    def bound(self, corpus, gamma=None, subsample_ratio=1.0):
+    def bound(self, corpus, alpha, gamma=None, subsample_ratio=1.0):
         """
         Estimate the variational bound of documents from `corpus`:
         E_q[log p(corpus)] - E_q[log q(corpus)]
@@ -641,10 +653,10 @@ class LdaModel(interfaces.TransformationABC):
                 logger.debug("bound: at document #%i" % d)
             
             # Document specific alpha    
-            alphad = self.alpha[d]
+            alphad = alpha[d]
             
             if gamma is None:
-                gammad, _ = self.inference([doc], alphad)
+                gammad, _ = self.inference([doc], [alphad])
             else:
                 gammad = gamma[d]
             Elogthetad = dirichlet_expectation(gammad)
@@ -675,7 +687,7 @@ class LdaModel(interfaces.TransformationABC):
     def print_topics(self, num_topics=10, num_words=10):
         return self.show_topics(num_topics, num_words, log=True)
 
-    def show_topics(self, num_topics=10, num_words=10, log=False, formatted=True):
+    def show_topics(self, num_topics=10, num_words=10, log=False, formatted=True, sort_alpha = None):
         """
         For `num_topics` number of topics, return `num_words` most significant words
         (10 words per topic, by default).
@@ -696,11 +708,11 @@ class LdaModel(interfaces.TransformationABC):
         else:
             num_topics = min(num_topics, self.num_topics)
 
-            # add a little random jitter, to randomize results around the same alpha
-            # since alpha has been defined for *each* document, let's just use the first
-            # for now
-            sort_alpha = self.alpha[0] + 0.0001 * numpy.random.rand(len(self.alpha[0]))
-
+            # If no ordering is specified we use a random order
+            # Note that there is no global alpha any longer
+            if sort_alpha == None:
+                sort_alpha = numpy.random.rand(self.num_topics)
+            
             sorted_topics = list(matutils.argsort(sort_alpha))
             chosen_topics = sorted_topics[:num_topics // 2] + sorted_topics[-num_topics // 2:]
 
@@ -743,7 +755,7 @@ class LdaModel(interfaces.TransformationABC):
         """
         is_corpus, corpus = utils.is_corpus(corpus)
         if not is_corpus:
-            logger.warning("LdaModel.top_topics() called with an empty corpus")
+            logger.warning("mLdaModel.top_topics() called with an empty corpus")
             return
 
         topics = []
@@ -802,7 +814,8 @@ class LdaModel(interfaces.TransformationABC):
 
         Ignore topics with very low probability (below `minimum_probability`).
         
-        Should provide an alpha value for inference.
+        Should provide an `alpha` value for inference as a K-dimensional vector
+        *not* an Alpha object.
 
         """
         # if the input vector is a corpus, return a transformed corpus
@@ -814,20 +827,23 @@ class LdaModel(interfaces.TransformationABC):
         if is_corpus:
             return self._apply(corpus)
 
-        gamma, _ = self.inference([bow], alpha)
+        gamma, _ = self.inference([bow], [alpha])
         topic_dist = gamma[0] / sum(gamma[0])  # normalize distribution
         return [(topicid, topicvalue) for topicid, topicvalue in enumerate(topic_dist)
                 if topicvalue >= minimum_probability]
 
-    def __getitem__(self, bow, eps=None):
+    def __getitem__(self, bowAndAlpha, eps=None):
         """
         Return topic distribution for the given document `bow`, as a list of
         (topic_id, topic_probability) 2-tuples.
 
         Ignore topics with very low probability (below `eps`).
+        
+        `alpha` should here be a K-dimensional vector, *not* an Alpha object.
 
         """
-        return self.get_document_topics(bow, eps)
+        bow, alpha = bowAndAlpha
+        return self.get_document_topics(bow, alpha, eps)
 
     def save(self, fname, *args, **kwargs):
         """
@@ -850,7 +866,7 @@ class LdaModel(interfaces.TransformationABC):
         """
         if self.state is not None:
             self.state.save(utils.smart_extension(fname, '.state'), *args, **kwargs)
-        super(LdaModel, self).save(fname, *args, ignore=['state', 'dispatcher'], **kwargs)
+        super(mLdaModel, self).save(fname, *args, ignore=['state', 'dispatcher'], **kwargs)
 
     @classmethod
     def load(cls, fname, *args, **kwargs):
@@ -859,15 +875,15 @@ class LdaModel(interfaces.TransformationABC):
 
         Large arrays can be memmap'ed back as read-only (shared memory) by setting `mmap='r'`:
 
-            >>> LdaModel.load(fname, mmap='r')
+            >>> mLdaModel.load(fname, mmap='r')
 
         """
         kwargs['mmap'] = kwargs.get('mmap', None)
-        result = super(LdaModel, cls).load(fname, *args, **kwargs)
+        result = super(mLdaModel, cls).load(fname, *args, **kwargs)
         state_fname = utils.smart_extension(fname, '.state')
         try:
-            result.state = super(LdaModel, cls).load(state_fname, *args, **kwargs)
+            result.state = super(mLdaModel, cls).load(state_fname, *args, **kwargs)
         except Exception as e:
             logging.warning("failed to load state from %s: %s" % (state_fname, e))
         return result
-# endclass LdaModel
+# endclass mLdaModel
